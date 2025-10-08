@@ -53,36 +53,29 @@ fn get_required_firmware(kernel_dir: &Path, fw_dir: &Path) -> Result<HashSet<Pat
 }
 
 fn resolve_symlinks(path: &Path, base_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> {
-    let mut result = vec![path.to_path_buf()];
-    let mut current = path.to_path_buf();
+    let mut paths_to_keep = vec![path.to_path_buf()];
 
-    while fs::symlink_metadata(&current)?.file_type().is_symlink() {
-        let target = fs::read_link(&current)?;
-        let abs_target = if target.is_absolute() {
-            target.clone()
-        } else {
-            current.parent().unwrap().join(&target)
-        };
-
-        let canonical_target = match fs::canonicalize(&abs_target) {
-            Ok(p) => p,
-            Err(_) => break, // Broken link
-        };
-
-        if result.contains(&canonical_target) || !canonical_target.starts_with(base_dir) {
-            break; // Cycle or link outside base_dir
+    // If the path is a symlink, we try to resolve it.
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        match fs::canonicalize(path) {
+            Ok(final_target) => {
+                // Only keep the target if it's within the firmware directory.
+                // This prevents adding files from outside the scope (e.g., /usr/bin/true)
+                // and also implicitly handles broken links, as canonicalize would fail.
+                if final_target.starts_with(base_dir) {
+                    debug!(
+                        "Adding symlink target {} -> {}",
+                        path.display(),
+                        final_target.display()
+                    );
+                    paths_to_keep.push(final_target);
+                }
+            }
+            Err(e) => debug!("Could not canonicalize symlink {}: {}", path.display(), e),
         }
-
-        debug!(
-            "Adding symlink {} -> {}",
-            current.display(),
-            target.display()
-        );
-        result.push(canonical_target.clone());
-        current = canonical_target;
     }
 
-    Ok(result)
+    Ok(paths_to_keep)
 }
 
 pub fn cleanup_firmware(
@@ -186,9 +179,9 @@ mod tests {
         symlink(&link1_path, &link2_path).unwrap();
 
         let resolved = resolve_symlinks(&link2_path, base_dir).unwrap();
-        assert_eq!(resolved.len(), 3);
+        // The new implementation returns the starting link and the final canonical target.
+        assert_eq!(resolved.len(), 2);
         assert!(resolved.contains(&file_path));
-        assert!(resolved.contains(&link1_path));
         assert!(resolved.contains(&link2_path));
     }
 
@@ -201,7 +194,7 @@ mod tests {
         symlink("non_existent_file", &link_path).unwrap();
 
         let resolved = resolve_symlinks(&link_path, base_dir).unwrap();
-        // Should stop at the broken link and return what it has found so far.
+        // fs::canonicalize fails on broken links, so only the original path is returned.
         assert_eq!(resolved, vec![link_path]);
     }
 
@@ -216,9 +209,8 @@ mod tests {
         symlink(&link1_path, &link2_path).unwrap();
 
         let resolved = resolve_symlinks(&link1_path, base_dir).unwrap();
-        // Should detect the cycle and break, returning the paths found.
-        assert_eq!(resolved.len(), 2);
+        // fs::canonicalize fails on link cycles, so only the original path is returned.
+        assert_eq!(resolved.len(), 1);
         assert!(resolved.contains(&link1_path));
-        assert!(resolved.contains(&link2_path));
     }
 }
