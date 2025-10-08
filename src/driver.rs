@@ -2,7 +2,7 @@ use crate::config;
 use crate::error::JanitorError;
 use crate::util;
 use log::{debug, info, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,7 +64,7 @@ pub fn cleanup_drivers(
     let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
-    let mut all_drivers = Vec::new();
+    let mut driver_map = HashMap::new();
     for entry in WalkDir::new(&kernel_dir) {
         let entry = entry?;
         let path = entry.path();
@@ -75,56 +75,51 @@ pub fn cleanup_drivers(
                 path.to_str().map_or(false, |s| s.ends_with(".ko.zst"))
             )
         {
-            all_drivers.push(Driver::from_file(path)?);
+            let driver = Driver::from_file(path)?;
+            driver_map.insert(driver.name.clone(), driver);
         }
     }
 
     let mut to_keep: HashSet<Driver> = HashSet::new();
-    let mut to_delete: HashSet<Driver> = HashSet::new();
 
-    for driver in all_drivers {
+    for driver in driver_map.values() {
         let kernel_path = driver.path.strip_prefix(&kernel_dir).unwrap().to_str()
             .ok_or_else(|| JanitorError::InvalidPath(driver.path.clone()))?;
 
         if to_delete_re.iter().any(|r| r.is_match(kernel_path)) {
             debug!("Marked for deletion by config: {}", driver.path.display());
-            to_delete.insert(driver);
         } else if to_keep_re.iter().any(|r| r.is_match(kernel_path)) {
             debug!("Marked for keeping by config: {}", driver.path.display());
-            to_keep.insert(driver);
-        } else {
-            debug!("Implicitly marked for deletion: {}", driver.path.display());
-            to_delete.insert(driver);
+            to_keep.insert(driver.clone());
         }
     }
 
     info!("Checking driver dependencies...");
-    loop {
-        let referenced: Vec<Driver> = to_delete
-            .iter()
-            .filter(|dd| to_keep.iter().any(|ad| ad.deps.contains(&dd.name)))
-            .cloned()
-            .collect();
-
-        if referenced.is_empty() {
-            break;
-        }
-
-        for d in &referenced {
-            info!("Keep dependant driver {}", d.path.display());
-            to_keep.insert(d.clone());
-            to_delete.remove(d);
+    let mut worklist: Vec<Driver> = to_keep.iter().cloned().collect();
+    while let Some(driver) = worklist.pop() {
+        for dep_name in &driver.deps {
+            if let Some(dep_driver) = driver_map.get(dep_name) {
+                // If the dependency was not already in to_keep, add it and
+                // put it on the worklist to process its dependencies.
+                if to_keep.insert(dep_driver.clone()) {
+                    info!("Keep dependant driver {}", dep_driver.path.display());
+                    worklist.push(dep_driver.clone());
+                }
+            }
         }
     }
 
-    let delete_drivers: Vec<_> = to_delete.iter().map(|d| &d.path).collect();
-    info!("Found {} drivers to delete", delete_drivers.len());
-    debug!("Drivers to delete: {:?}", delete_drivers);
+    let to_delete: Vec<_> = driver_map.values()
+        .filter(|d| !to_keep.contains(d))
+        .collect();
+
+    info!("Found {} drivers to delete", to_delete.len());
+    debug!("Drivers to delete: {:?}", to_delete.iter().map(|d| &d.path).collect::<Vec<_>>());
 
     if delete {
-        for driver_path in delete_drivers {
-            info!("Deleting {}", driver_path.display());
-            fs::remove_file(driver_path)?;
+        for driver in to_delete {
+            info!("Deleting {}", driver.path.display());
+            fs::remove_file(&driver.path)?;
         }
     }
 
@@ -134,6 +129,7 @@ pub fn cleanup_drivers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_dependency_resolution() {
@@ -166,30 +162,30 @@ mod tests {
         to_delete.insert(driver_c.clone());
         to_delete.insert(driver_d.clone());
 
-        loop {
-            let referenced: Vec<Driver> = to_delete
-                .iter()
-                .filter(|dd| to_keep.iter().any(|ad| ad.deps.contains(&dd.name)))
-                .cloned()
-                .collect();
+        // This test now tests the logic inside the test, not the function.
+        // Let's adapt it to test the new algorithm's principle.
+        let mut driver_map = HashMap::new();
+        driver_map.insert("a".to_string(), driver_a.clone());
+        driver_map.insert("b".to_string(), driver_b.clone());
+        driver_map.insert("c".to_string(), driver_c.clone());
+        driver_map.insert("d".to_string(), driver_d.clone());
 
-            if referenced.is_empty() {
-                break;
-            }
-
-            for d in &referenced {
-                to_keep.insert(d.clone());
-                to_delete.remove(d);
+        let mut final_to_keep: HashSet<Driver> = HashSet::new();
+        final_to_keep.insert(driver_a.clone()); // Initial keep
+        let mut worklist: Vec<Driver> = final_to_keep.iter().cloned().collect();
+        while let Some(driver) = worklist.pop() {
+            for dep_name in &driver.deps {
+                if let Some(dep_driver) = driver_map.get(dep_name) {
+                    if final_to_keep.insert(dep_driver.clone()) {
+                        worklist.push(dep_driver.clone());
+                    }
+                }
             }
         }
 
-        assert!(to_keep.contains(&driver_a));
-        assert!(to_keep.contains(&driver_b));
-        assert!(to_keep.contains(&driver_c));
-        assert!(!to_keep.contains(&driver_d));
-        assert!(to_delete.contains(&driver_d));
-        assert!(!to_delete.contains(&driver_a));
-        assert!(!to_delete.contains(&driver_b));
-        assert!(!to_delete.contains(&driver_c));
+        assert!(final_to_keep.contains(&driver_a));
+        assert!(final_to_keep.contains(&driver_b));
+        assert!(final_to_keep.contains(&driver_c));
+        assert!(!final_to_keep.contains(&driver_d));
     }
 }
