@@ -1,23 +1,11 @@
 use crate::error::JanitorError;
+use crate::util;
 use log::{debug, info};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
-
-fn find_kernel_dir(module_dir: &Path) -> Result<PathBuf, JanitorError> {
-    if !module_dir.exists() {
-        return Err(JanitorError::NoKernelDir(module_dir.to_path_buf()));
-    }
-    let mut entries = fs::read_dir(module_dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect::<Vec<_>>();
-
-    entries.pop().ok_or_else(|| JanitorError::NoKernelDir(module_dir.to_path_buf()))
-}
 
 fn get_required_firmware(kernel_dir: &Path, fw_dir: &Path) -> Result<HashSet<PathBuf>, JanitorError> {
     let mut required = HashSet::new();
@@ -102,7 +90,7 @@ pub fn cleanup_firmware(
     fw_dir: &Path,
     delete: bool,
 ) -> Result<(), JanitorError> {
-    let kernel_dir = find_kernel_dir(module_dir)?;
+    let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
     let required_fw_abs = get_required_firmware(&kernel_dir, fw_dir)?;

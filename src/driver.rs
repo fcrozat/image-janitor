@@ -1,5 +1,6 @@
 use crate::config;
 use crate::error::JanitorError;
+use crate::util;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::fs;
@@ -54,27 +55,13 @@ impl Driver {
     }
 }
 
-fn find_kernel_dir(module_dir: &Path) -> Result<PathBuf, JanitorError> {
-    if !module_dir.exists() {
-        return Err(JanitorError::NoKernelDir(module_dir.to_path_buf()));
-    }
-    let mut entries = fs::read_dir(module_dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect::<Vec<_>>();
-
-    // In the Live ISO there should be just one kernel installed
-    entries.pop().ok_or_else(|| JanitorError::NoKernelDir(module_dir.to_path_buf()))
-}
-
 pub fn cleanup_drivers(
     config_paths: &[&str],
     module_dir: &Path,
     delete: bool,
 ) -> Result<(), JanitorError> {
     let (to_keep_re, to_delete_re) = config::read_config(config_paths)?;
-    let kernel_dir = find_kernel_dir(module_dir)?;
+    let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
     let mut all_drivers = Vec::new();
