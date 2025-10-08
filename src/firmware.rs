@@ -41,14 +41,14 @@ fn get_required_firmware(kernel_dir: &Path, fw_dir: &Path) -> Result<HashSet<Pat
             if output.status.success() {
                 let firmware_list = String::from_utf8(output.stdout).unwrap_or_default();
                 for fw_name in firmware_list.lines() {
-                    let pattern = if !fw_name.ends_with('*') {
-                        format!("{{{},{}.xz,{}.zst}}", fw_name, fw_name, fw_name)
+                    let full_pattern_str = if !fw_name.ends_with('*') {
+                        let base_path = fw_dir.join(fw_name);
+                        format!("{}.{{,xz,zst}}", base_path.display())
                     } else {
-                        fw_name.to_string()
+                        fw_dir.join(fw_name).to_string_lossy().to_string()
                     };
 
-                    let full_pattern = fw_dir.join(pattern);
-                    let matching = glob::glob(full_pattern.to_str().unwrap()).expect("Failed to read glob pattern");
+                    let matching = glob::glob(&full_pattern_str).expect("Failed to read glob pattern");
 
                     for m in matching {
                         if let Ok(path) = m {
@@ -167,4 +167,70 @@ pub fn cleanup_firmware(
     info!("Unused firmware size: {} ({} MiB)", unused_size, unused_size >> 20);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_resolve_symlinks_single_file() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("file.bin");
+        fs::write(&file_path, "data").unwrap();
+
+        let resolved = resolve_symlinks(&file_path, temp_dir.path()).unwrap();
+        assert_eq!(resolved, vec![file_path]);
+    }
+
+    #[test]
+    fn test_resolve_symlinks_linear_chain() {
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path();
+        let file_path = base_dir.join("file.bin");
+        let link1_path = base_dir.join("link1");
+        let link2_path = base_dir.join("link2");
+
+        fs::write(&file_path, "data").unwrap();
+        symlink(&file_path, &link1_path).unwrap();
+        symlink(&link1_path, &link2_path).unwrap();
+
+        let resolved = resolve_symlinks(&link2_path, base_dir).unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert!(resolved.contains(&file_path));
+        assert!(resolved.contains(&link1_path));
+        assert!(resolved.contains(&link2_path));
+    }
+
+    #[test]
+    fn test_resolve_symlinks_broken_link() {
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path();
+        let link_path = base_dir.join("link");
+
+        symlink("non_existent_file", &link_path).unwrap();
+
+        let resolved = resolve_symlinks(&link_path, base_dir).unwrap();
+        // Should stop at the broken link and return what it has found so far.
+        assert_eq!(resolved, vec![link_path]);
+    }
+
+    #[test]
+    fn test_resolve_symlinks_cycle() {
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path();
+        let link1_path = base_dir.join("link1");
+        let link2_path = base_dir.join("link2");
+
+        symlink(&link2_path, &link1_path).unwrap();
+        symlink(&link1_path, &link2_path).unwrap();
+
+        let resolved = resolve_symlinks(&link1_path, base_dir).unwrap();
+        // Should detect the cycle and break, returning the paths found.
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&link1_path));
+        assert!(resolved.contains(&link2_path));
+    }
 }
