@@ -78,6 +78,70 @@ fn resolve_symlinks(path: &Path, base_dir: &Path) -> Result<Vec<PathBuf>, Janito
     Ok(paths_to_keep)
 }
 
+fn remove_unused_files(
+    fw_dir: &Path,
+    required_fw: &HashSet<PathBuf>,
+    delete: bool,
+) -> Result<u64, JanitorError> {
+    info!("Scanning for unused firmware files...");
+    let mut unused_size = 0;
+
+    for entry in WalkDir::new(fw_dir).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_file() {
+            let relative_path = path.strip_prefix(fw_dir).unwrap().to_path_buf();
+            if !required_fw.contains(&relative_path) {
+                unused_size += fs::metadata(path)?.len();
+                if delete {
+                    info!("Deleting unused firmware {}", path.display());
+                    fs::remove_file(path)?;
+                } else {
+                    debug!("Found unused firmware {}", path.display());
+                }
+            }
+        }
+    }
+    Ok(unused_size)
+}
+
+fn remove_dangling_symlinks(fw_dir: &Path) -> Result<(), JanitorError> {
+    info!("Removing dangling symlinks...");
+    for entry in WalkDir::new(fw_dir).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_symlink() {
+            // fs::metadata follows symlinks, so it will return an error for a dangling one.
+            if fs::metadata(path).is_err() {
+                info!("Deleting dangling symlink {}", path.display());
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_directories(fw_dir: &Path) -> Result<(), JanitorError> {
+    info!("Removing empty directories...");
+    // We need to walk from the deepest directories up to ensure parent directories become empty.
+    let mut dirs_to_check: Vec<PathBuf> = WalkDir::new(fw_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    // Sort by depth, deepest first.
+    dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+    for dir_path in dirs_to_check {
+        // Only remove if it's empty and not the root firmware directory itself.
+        if dir_path != fw_dir && fs::read_dir(&dir_path)?.next().is_none() {
+            info!("Deleting empty directory {}", dir_path.display());
+            fs::remove_dir(dir_path)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn cleanup_firmware(
     module_dir: &Path,
     fw_dir: &Path,
@@ -91,61 +155,14 @@ pub fn cleanup_firmware(
         .map(|p| p.strip_prefix(fw_dir).unwrap().to_path_buf())
         .collect();
 
-    info!("Removing unused firmware...");
-    let mut unused_size = 0;
-
-    for entry in WalkDir::new(fw_dir).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_file() {
-            let relative_path = path.strip_prefix(fw_dir).unwrap().to_path_buf();
-            if !required_fw.contains(&relative_path) {
-                unused_size += fs::metadata(path)?.len();
-                if delete {
-                    info!("Deleting unused firmware {}", path.display());
-                    fs::remove_file(path)?;
-                } else {
-                    info!("Found unused firmware {}", path.display());
-                }
-            }
-        }
-    }
+    let unused_size = remove_unused_files(fw_dir, &required_fw, delete)?;
 
     if delete {
-        info!("Removing dangling symlinks...");
-        for entry in WalkDir::new(fw_dir).into_iter().filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_symlink() {
-                // Check if the symlink is dangling
-                if fs::metadata(path).is_err() {
-                    info!("Deleting dangling symlink {}", path.display());
-                    fs::remove_file(path)?;
-                }
-            }
-        }
-
-        // Removing empty directories.
-        // We need to walk from the deepest directories up to ensure parent directories become empty.
-        info!("Removing empty directories...");
-        let mut dirs_to_check: Vec<PathBuf> = WalkDir::new(fw_dir)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.path().to_path_buf())
-            .collect();
-
-        dirs_to_check.sort_by_key(|p| p.components().count());
-        dirs_to_check.reverse(); // Start from deepest
-
-        for dir_path in dirs_to_check {
-            // Only remove if it's empty and not the root firmware directory itself
-            if dir_path != fw_dir && fs::read_dir(&dir_path)?.next().is_none() {
-                info!("Deleting empty directory {}", dir_path.display());
-                fs::remove_dir(dir_path)?;
-            }
-        }
+        remove_dangling_symlinks(fw_dir)?;
+        remove_empty_directories(fw_dir)?;
     }
 
-    info!("Unused firmware size: {} ({} MiB)", unused_size, unused_size >> 20);
+    info!("Potential savings: {} ({} MiB)", unused_size, unused_size >> 20);
 
     Ok(())
 }
@@ -212,5 +229,92 @@ mod tests {
         // fs::canonicalize fails on link cycles, so only the original path is returned.
         assert_eq!(resolved.len(), 1);
         assert!(resolved.contains(&link1_path));
+    }
+
+    #[test]
+    fn test_remove_unused_files() {
+        let temp_dir = tempdir().unwrap();
+        let fw_dir = temp_dir.path();
+
+        let required_file_path = PathBuf::from("required.bin");
+        let unused_file_path = PathBuf::from("unused.bin");
+
+        fs::write(fw_dir.join(&required_file_path), "required_data").unwrap();
+        fs::write(fw_dir.join(&unused_file_path), "unused_data").unwrap();
+
+        let mut required_fw = HashSet::new();
+        required_fw.insert(required_file_path.clone());
+
+        // Test without deleting
+        let unused_size = remove_unused_files(fw_dir, &required_fw, false).unwrap();
+        assert_eq!(unused_size, 11); // "unused_data".len()
+        assert!(fw_dir.join(&unused_file_path).exists());
+        assert!(fw_dir.join(&required_file_path).exists());
+
+        // Test with deleting
+        let unused_size_del = remove_unused_files(fw_dir, &required_fw, true).unwrap();
+        assert_eq!(unused_size_del, 11);
+        assert!(!fw_dir.join(&unused_file_path).exists());
+        assert!(fw_dir.join(&required_file_path).exists());
+    }
+
+    #[test]
+    fn test_remove_dangling_symlinks() {
+        let temp_dir = tempdir().unwrap();
+        let fw_dir = temp_dir.path();
+
+        let target_file = fw_dir.join("target.bin");
+        let valid_symlink = fw_dir.join("valid_link");
+        let dangling_symlink = fw_dir.join("dangling_link");
+
+        fs::write(&target_file, "data").unwrap();
+        symlink(&target_file, &valid_symlink).unwrap();
+        symlink("non_existent_file", &dangling_symlink).unwrap();
+
+        assert!(dangling_symlink.is_symlink());
+
+        remove_dangling_symlinks(fw_dir).unwrap();
+
+        assert!(valid_symlink.exists());
+        assert!(!dangling_symlink.exists());
+        assert!(!dangling_symlink.is_symlink()); // Should be completely gone
+    }
+
+    #[test]
+    fn test_remove_empty_directories() {
+        let temp_dir = tempdir().unwrap();
+        let fw_dir = temp_dir.path();
+
+        // Create a structure of directories
+        let dir_a = fw_dir.join("a");
+        let dir_b = dir_a.join("b"); // Will be empty
+        let dir_c = dir_a.join("c");
+        let dir_d = fw_dir.join("d"); // Will be empty
+
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::create_dir_all(&dir_c).unwrap();
+        fs::create_dir_all(&dir_d).unwrap();
+
+        // Add a file to make dir_c non-empty
+        fs::write(dir_c.join("file.txt"), "data").unwrap();
+
+        assert!(dir_b.exists());
+        assert!(dir_d.exists());
+
+        remove_empty_directories(fw_dir).unwrap();
+
+        // Assert empty directories are removed
+        assert!(!dir_b.exists());
+        assert!(!dir_d.exists());
+
+        // Assert non-empty directories (and the root) remain
+        assert!(dir_a.exists());
+        assert!(dir_c.exists());
+        assert!(fw_dir.exists());
+
+        // Run again to ensure it handles the case where 'a' is now empty
+        fs::remove_dir_all(&dir_c).unwrap();
+        remove_empty_directories(fw_dir).unwrap();
+        assert!(!dir_a.exists());
     }
 }
