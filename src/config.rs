@@ -1,11 +1,14 @@
+use crate::command::CommandRunner;
 use crate::error::JanitorError;
 use log::{debug, info};
 use regex::Regex;
 use std::fs;
-use std::process::Command;
 
 /// Reads the configuration files and returns two lists of regexes: one for keeping and one for deleting.
-pub fn read_config(paths: &[&str]) -> Result<(Vec<Regex>, Vec<Regex>), JanitorError> {
+pub fn read_config(
+    paths: &[&str],
+    runner: &dyn CommandRunner,
+) -> Result<(Vec<Regex>, Vec<Regex>), JanitorError> {
     let mut lines = Vec::<String>::new();
     for path in paths {
         info!("Reading config file: {}", path);
@@ -19,7 +22,7 @@ pub fn read_config(paths: &[&str]) -> Result<(Vec<Regex>, Vec<Regex>), JanitorEr
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
-    let arch = get_arch()?;
+    let arch = get_arch(runner)?;
     debug!("Current architecture: {}", arch);
     let filtered_lines = arch_filter(lines, &arch);
 
@@ -40,20 +43,8 @@ pub fn read_config(paths: &[&str]) -> Result<(Vec<Regex>, Vec<Regex>), JanitorEr
     Ok((to_keep, to_delete))
 }
 
-// This function calls an external command, which makes it harder to test.
-// For a real-world scenario, this should be behind a trait that can be mocked.
-fn get_arch() -> Result<String, JanitorError> {
-    let output = Command::new("arch")
-        .output()
-        .map_err(|e| JanitorError::Command(format!("Failed to execute 'arch': {}", e)))?;
-
-    if !output.status.success() {
-        return Err(JanitorError::Command(
-            "'arch' command failed".to_string(),
-        ));
-    }
-
-    Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
+fn get_arch(runner: &dyn CommandRunner) -> Result<String, JanitorError> {
+    runner.run("arch", &[])
 }
 
 fn arch_filter(lines: Vec<String>, arch: &str) -> Vec<String> {
@@ -62,21 +53,25 @@ fn arch_filter(lines: Vec<String>, arch: &str) -> Vec<String> {
     let mut arch_tag: Option<String> = None;
 
     for line in lines {
-        if let Some(captures) = Regex::new(r"^\s*<\s*(\w+)\s*>\s*$").unwrap().captures(&line) {
+        if let Some(captures) = Regex::new(r"^\s*<(\w+)\s*>\s*$").unwrap().captures(&line) {
             let tag = captures.get(1).unwrap().as_str().to_string();
             skipping = tag != arch;
             arch_tag = Some(tag);
             continue;
         }
 
-        if Regex::new(r"^\s*</\s*\w+\s*>\s*$").unwrap().is_match(&line) {
+        if Regex::new(r"^\s*</\w+\s*>\s*$").unwrap().is_match(&line) {
             skipping = false;
             arch_tag = None;
             continue;
         }
 
         if skipping {
-            debug!("Ignoring {} specific line: {}", arch_tag.as_deref().unwrap_or(""), line);
+            debug!(
+                "Ignoring {} specific line: {}",
+                arch_tag.as_deref().unwrap_or(""),
+                line
+            );
         } else {
             filtered.push(line);
         }
@@ -88,6 +83,22 @@ fn arch_filter(lines: Vec<String>, arch: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::CommandRunner;
+    use crate::error::JanitorError;
+    use std::collections::HashMap;
+
+    struct MockCommandRunner {
+        commands: HashMap<String, String>,
+    }
+
+    impl CommandRunner for MockCommandRunner {
+        fn run(&self, command: &str, _args: &[&str]) -> Result<String, JanitorError> {
+            self.commands
+                .get(command)
+                .cloned()
+                .ok_or_else(|| JanitorError::Command(format!("Command not found: {}", command)))
+        }
+    }
 
     #[test]
     fn test_arch_filter() {
@@ -118,5 +129,28 @@ mod tests {
 
         let s390x_lines = arch_filter(lines.clone(), "s390x");
         assert_eq!(s390x_lines, vec!["ibm_driver", "common_driver"]);
+    }
+
+    #[test]
+    fn test_read_config_with_arch() {
+        let mut commands = HashMap::new();
+        commands.insert("arch".to_string(), "x86_64".to_string());
+        let runner = MockCommandRunner { commands };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test.conf");
+        fs::write(
+            &config_path,
+            "<x86_64>\n-delete_me\n</x86_64>\n<aarch64>\n-not_me\n</aarch64>\nkeep_me",
+        )
+        .unwrap();
+
+        let (to_keep, to_delete) =
+            read_config(&[config_path.to_str().unwrap()], &runner).unwrap();
+
+        assert_eq!(to_keep.len(), 1);
+        assert_eq!(to_delete.len(), 1);
+        assert!(to_keep[0].is_match("keep_me"));
+        assert!(to_delete[0].is_match("delete_me"));
     }
 }

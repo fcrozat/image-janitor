@@ -1,10 +1,10 @@
+use crate::command::CommandRunner;
 use crate::error::JanitorError;
 use crate::util;
 use log::{debug, info};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use walkdir::WalkDir;
 
 fn find_kernel_modules(kernel_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> {
@@ -23,24 +23,14 @@ fn find_kernel_modules(kernel_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> 
     Ok(modules)
 }
 
-fn get_firmware_deps_for_module(module_path: &Path) -> Result<Vec<String>, JanitorError> {
-    let output = Command::new("/usr/sbin/modinfo")
-        .arg("-F")
-        .arg("firmware")
-        .arg(module_path)
-        .output()?;
-
-    if !output.status.success() {
-        // Some modules might not be valid, so we just log and continue.
-        debug!(
-            "modinfo failed for {}: {}",
-            module_path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Ok(Vec::new());
-    }
-
-    let firmware_list = String::from_utf8(output.stdout).unwrap_or_default();
+fn get_firmware_deps_for_module(
+    module_path: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<String>, JanitorError> {
+    let firmware_list = runner.run(
+        "/usr/sbin/modinfo",
+        &["-F", "firmware", module_path.to_str().unwrap()],
+    )?;
     Ok(firmware_list.lines().map(String::from).collect())
 }
 
@@ -69,12 +59,16 @@ fn find_firmware_files_from_name(
     }
 }
 
-fn get_required_firmware(kernel_dir: &Path, fw_dir: &Path) -> Result<HashSet<PathBuf>, JanitorError> {
+fn get_required_firmware(
+    kernel_dir: &Path,
+    fw_dir: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<HashSet<PathBuf>, JanitorError> {
     let mut required = HashSet::new();
     let kernel_modules = find_kernel_modules(kernel_dir)?;
 
     for module_path in kernel_modules {
-        let firmware_names = get_firmware_deps_for_module(&module_path)?;
+        let firmware_names = get_firmware_deps_for_module(&module_path, runner)?;
         for fw_name in firmware_names {
             let firmware_files = find_firmware_files_from_name(&fw_name, fw_dir)?;
             for fw_file in firmware_files {
@@ -180,11 +174,12 @@ pub fn cleanup_firmware(
     module_dir: &Path,
     fw_dir: &Path,
     delete: bool,
+    runner: &dyn CommandRunner,
 ) -> Result<(), JanitorError> {
     let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
-    let required_fw_abs = get_required_firmware(&kernel_dir, fw_dir)?;
+    let required_fw_abs = get_required_firmware(&kernel_dir, fw_dir, runner)?;
     let required_fw: HashSet<_> = required_fw_abs.into_iter()
         .map(|p| p.strip_prefix(fw_dir).unwrap().to_path_buf())
         .collect();
@@ -204,8 +199,46 @@ pub fn cleanup_firmware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::CommandRunner;
+    use std::collections::HashMap;
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
+
+    struct MockCommandRunner {
+        responses: HashMap<String, String>,
+    }
+
+    impl CommandRunner for MockCommandRunner {
+        fn run(&self, command: &str, args: &[&str]) -> Result<String, JanitorError> {
+            let key = format!("{} {}", command, args.join(" "));
+            self.responses.get(&key).cloned().ok_or(JanitorError::Command("Not mocked".to_string()))
+        }
+    }
+
+    #[test]
+    fn test_get_required_firmware() {
+        let temp_dir = tempdir().unwrap();
+        let kernel_dir = temp_dir.path().join("lib/modules/6.1.0-test");
+        fs::create_dir_all(&kernel_dir).unwrap();
+        let fw_dir = temp_dir.path().join("lib/firmware");
+        fs::create_dir_all(&fw_dir).unwrap();
+
+        let mod1_path = kernel_dir.join("mod1.ko");
+        fs::write(&mod1_path, "").unwrap();
+        let fw1_path = fw_dir.join("fw1.bin");
+        fs::write(&fw1_path, "").unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("/usr/sbin/modinfo -F firmware {}", mod1_path.display()),
+            "fw1.bin".to_string(),
+        );
+        let runner = MockCommandRunner { responses };
+
+        let required_fw = get_required_firmware(&kernel_dir, &fw_dir, &runner).unwrap();
+        assert_eq!(required_fw.len(), 1);
+        assert!(required_fw.contains(&fw1_path));
+    }
 
     #[test]
     fn test_resolve_symlinks_single_file() {

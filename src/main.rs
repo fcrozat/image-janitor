@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use env_logger::Env;
-use image_janitor::{driver, firmware};
+use image_janitor::{command::SystemCommandRunner, driver, firmware};
 use log::info;
 use std::path::PathBuf;
 
@@ -54,6 +54,8 @@ fn main() -> Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(Env::default().default_filter_or(log_level)).init();
 
+    let runner = SystemCommandRunner;
+
     match &cli.command {
         Commands::DriverCleanup {
             delete,
@@ -66,7 +68,7 @@ fn main() -> Result<()> {
                 module_dir.display()
             );
             let config_paths: Vec<&str> = config_files.split(',').collect();
-            driver::cleanup_drivers(&config_paths, module_dir, *delete)?;
+            driver::cleanup_drivers(&config_paths, module_dir, *delete, &runner)?;
         }
         Commands::FwCleanup {
             delete,
@@ -79,7 +81,7 @@ fn main() -> Result<()> {
                 module_dir.display(),
                 firmware_dir.display()
             );
-            firmware::cleanup_firmware(module_dir, firmware_dir, *delete)?;
+            firmware::cleanup_firmware(module_dir, firmware_dir, *delete, &runner)?;
         }
     }
 
