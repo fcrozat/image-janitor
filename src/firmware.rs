@@ -40,7 +40,7 @@ fn find_firmware_files_from_name(
 ) -> Result<Vec<PathBuf>, JanitorError> {
     let pattern = fw_dir.join(fw_name).to_string_lossy().to_string();
 
-    if !fw_name.ends_with('*') {
+    if !fw_name.contains('*') {
         let paths_to_check = vec![
             PathBuf::from(&pattern),
             PathBuf::from(format!("{}.xz", pattern)),
@@ -210,8 +210,12 @@ mod tests {
 
     impl CommandRunner for MockCommandRunner {
         fn run(&self, command: &str, args: &[&str]) -> Result<String, JanitorError> {
-            let key = format!("{} {}", command, args.join(" "));
-            self.responses.get(&key).cloned().ok_or(JanitorError::Command("Not mocked".to_string()))
+            let key = if args.is_empty() {
+                command.to_string()
+            } else {
+                format!("{} {}", command, args.join(" "))
+            };
+            self.responses.get(&key).cloned().ok_or(JanitorError::Command(format!("Not mocked: {}", key)))
         }
     }
 
@@ -238,6 +242,36 @@ mod tests {
         let required_fw = get_required_firmware(&kernel_dir, &fw_dir, &runner).unwrap();
         assert_eq!(required_fw.len(), 1);
         assert!(required_fw.contains(&fw1_path));
+    }
+
+    #[test]
+    fn test_get_required_firmware_with_wildcard() {
+        let temp_dir = tempdir().unwrap();
+        let kernel_dir = temp_dir.path().join("lib/modules/6.1.0-test");
+        fs::create_dir_all(&kernel_dir).unwrap();
+        let fw_dir = temp_dir.path().join("lib/firmware");
+        fs::create_dir_all(&fw_dir).unwrap();
+
+        let mod1_path = kernel_dir.join("mod1.ko");
+        fs::write(&mod1_path, "").unwrap();
+
+        let fw_file1 = fw_dir.join("brcm/brcmfmac43430-sdio.bin");
+        let fw_file2 = fw_dir.join("brcm/brcmfmac43430-sdio.txt");
+        fs::create_dir_all(fw_dir.join("brcm")).unwrap();
+        fs::write(&fw_file1, "").unwrap();
+        fs::write(&fw_file2, "").unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("/usr/sbin/modinfo -F firmware {}", mod1_path.display()),
+            "brcm/brcmfmac*-sdio.bin".to_string(),
+        );
+        let runner = MockCommandRunner { responses };
+
+        let required_fw = get_required_firmware(&kernel_dir, &fw_dir, &runner).unwrap();
+        assert_eq!(required_fw.len(), 1);
+        assert!(required_fw.contains(&fw_file1));
+        assert!(!required_fw.contains(&fw_file2));
     }
 
     #[test]
