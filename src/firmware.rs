@@ -7,48 +7,82 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-fn get_required_firmware(kernel_dir: &Path, fw_dir: &Path) -> Result<HashSet<PathBuf>, JanitorError> {
-    let mut required = HashSet::new();
-
+fn find_kernel_modules(kernel_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> {
+    let mut modules = Vec::new();
     for entry in WalkDir::new(kernel_dir) {
         let entry = entry?;
         let path = entry.path();
         if path.is_file()
-            && (
-                path.extension().map_or(false, |e| e == "ko") ||
-                path.to_str().map_or(false, |s| s.ends_with(".ko.xz")) ||
-                path.to_str().map_or(false, |s| s.ends_with(".ko.zst"))
-            )
+            && (path.extension().map_or(false, |e| e == "ko")
+                || path.to_str().map_or(false, |s| s.ends_with(".ko.xz"))
+                || path.to_str().map_or(false, |s| s.ends_with(".ko.zst")))
         {
-            let output = Command::new("/usr/sbin/modinfo")
-                .arg("-F")
-                .arg("firmware")
-                .arg(path)
-                .output()?;
+            modules.push(path.to_path_buf());
+        }
+    }
+    Ok(modules)
+}
 
-            if output.status.success() {
-                let firmware_list = String::from_utf8(output.stdout).unwrap_or_default();
-                for fw_name in firmware_list.lines() {
-                    let full_pattern_str = if !fw_name.ends_with('*') {
-                        let base_path = fw_dir.join(fw_name);
-                        format!("{}.{{,xz,zst}}", base_path.display())
-                    } else {
-                        fw_dir.join(fw_name).to_string_lossy().to_string()
-                    };
+fn get_firmware_deps_for_module(module_path: &Path) -> Result<Vec<String>, JanitorError> {
+    let output = Command::new("/usr/sbin/modinfo")
+        .arg("-F")
+        .arg("firmware")
+        .arg(module_path)
+        .output()?;
 
-                    let matching = glob::glob(&full_pattern_str).expect("Failed to read glob pattern");
+    if !output.status.success() {
+        // Some modules might not be valid, so we just log and continue.
+        debug!(
+            "modinfo failed for {}: {}",
+            module_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(Vec::new());
+    }
 
-                    for m in matching {
-                        if let Ok(path) = m {
-                            let symlinks = resolve_symlinks(&path, fw_dir)?;
-                            required.extend(symlinks);
-                        }
-                    }
-                }
+    let firmware_list = String::from_utf8(output.stdout).unwrap_or_default();
+    Ok(firmware_list.lines().map(String::from).collect())
+}
+
+fn find_firmware_files_from_name(
+    fw_name: &str,
+    fw_dir: &Path,
+) -> Result<Vec<PathBuf>, JanitorError> {
+    let pattern = fw_dir.join(fw_name).to_string_lossy().to_string();
+
+    if !fw_name.ends_with('*') {
+        let paths_to_check = vec![
+            PathBuf::from(&pattern),
+            PathBuf::from(format!("{}.xz", pattern)),
+            PathBuf::from(format!("{}.zst", pattern)),
+        ];
+        Ok(paths_to_check
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect())
+    } else {
+        glob::glob(&pattern)
+            .expect("Failed to read glob pattern")
+            .filter_map(Result::ok)
+            .map(Ok)
+            .collect()
+    }
+}
+
+fn get_required_firmware(kernel_dir: &Path, fw_dir: &Path) -> Result<HashSet<PathBuf>, JanitorError> {
+    let mut required = HashSet::new();
+    let kernel_modules = find_kernel_modules(kernel_dir)?;
+
+    for module_path in kernel_modules {
+        let firmware_names = get_firmware_deps_for_module(&module_path)?;
+        for fw_name in firmware_names {
+            let firmware_files = find_firmware_files_from_name(&fw_name, fw_dir)?;
+            for fw_file in firmware_files {
+                let symlinks = resolve_symlinks(&fw_file, fw_dir)?;
+                required.extend(symlinks);
             }
         }
     }
-
     Ok(required)
 }
 
@@ -316,5 +350,65 @@ mod tests {
         fs::remove_dir_all(&dir_c).unwrap();
         remove_empty_directories(fw_dir).unwrap();
         assert!(!dir_a.exists());
+    }
+
+    #[test]
+    fn test_find_kernel_modules() {
+        let temp_dir = tempdir().unwrap();
+        let kernel_dir = temp_dir.path();
+
+        let mod1 = kernel_dir.join("module1.ko");
+        let mod2 = kernel_dir.join("module2.ko.xz");
+        let mod3 = kernel_dir.join("module3.ko.zst");
+        let not_a_mod = kernel_dir.join("not_a_module.txt");
+        let nested_dir = kernel_dir.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+        let nested_mod = nested_dir.join("nested.ko");
+
+        fs::write(&mod1, "").unwrap();
+        fs::write(&mod2, "").unwrap();
+        fs::write(&mod3, "").unwrap();
+        fs::write(&not_a_mod, "").unwrap();
+        fs::write(&nested_mod, "").unwrap();
+
+        let mut found = find_kernel_modules(kernel_dir).unwrap();
+        found.sort();
+
+        let mut expected = vec![mod1, mod2, mod3, nested_mod];
+        expected.sort();
+
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn test_find_firmware_files_from_name() {
+        let temp_dir = tempdir().unwrap();
+        let fw_dir = temp_dir.path();
+
+        let fw1 = fw_dir.join("iwlwifi-1.bin");
+        let fw2_xz = fw_dir.join("iwlwifi-2.bin.xz");
+        let fw3_zst = fw_dir.join("iwlwifi-3.bin.zst");
+        let other_file = fw_dir.join("other.txt");
+
+        fs::write(&fw1, "").unwrap();
+        fs::write(&fw2_xz, "").unwrap();
+        fs::write(&fw3_zst, "").unwrap();
+        fs::write(&other_file, "").unwrap();
+
+        // Test exact name matching with compressed variants
+        let mut found1 = find_firmware_files_from_name("iwlwifi-1.bin", fw_dir).unwrap();
+        found1.sort();
+        assert_eq!(found1, vec![fw1.clone()]);
+
+        let mut found2 = find_firmware_files_from_name("iwlwifi-2.bin", fw_dir).unwrap();
+        found2.sort();
+        assert_eq!(found2, vec![fw2_xz.clone()]);
+
+        // Test glob matching
+        let mut found_glob = find_firmware_files_from_name("iwlwifi-*", fw_dir).unwrap();
+        found_glob.sort();
+        let mut expected_glob = vec![fw1.clone(), fw2_xz.clone(), fw3_zst.clone()];
+        expected_glob.sort();
+        assert_eq!(found_glob, expected_glob);
     }
 }
