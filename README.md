@@ -80,3 +80,5 @@ The configuration files also support architecture-specific sections. For example
 drivers/net/ethernet/intel/.*
 </x86_64>
 ```
+
+Configuration files used for [Agama](https://agama-project.github.io/) installer are available in the `data` subdirectory.
