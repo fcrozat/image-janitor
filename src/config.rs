@@ -52,15 +52,18 @@ fn arch_filter(lines: Vec<String>, arch: &str) -> Vec<String> {
     let mut skipping = false;
     let mut arch_tag: Option<String> = None;
 
+    let start_tag_re = Regex::new(r"^\s*<(\w+)\s*>\s*$").unwrap();
+    let end_tag_re = Regex::new(r"^\s*</\w+\s*>\s*$").unwrap();
+
     for line in lines {
-        if let Some(captures) = Regex::new(r"^\s*<(\w+)\s*>\s*$").unwrap().captures(&line) {
+        if let Some(captures) = start_tag_re.captures(&line) {
             let tag = captures.get(1).unwrap().as_str().to_string();
             skipping = tag != arch;
             arch_tag = Some(tag);
             continue;
         }
 
-        if Regex::new(r"^\s*</\w+\s*>\s*$").unwrap().is_match(&line) {
+        if end_tag_re.is_match(&line) {
             skipping = false;
             arch_tag = None;
             continue;

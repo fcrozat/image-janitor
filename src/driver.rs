@@ -62,9 +62,9 @@ pub fn cleanup_drivers(
         let path = entry.path();
         if path.is_file()
             && (
-                path.extension().map_or(false, |e| e == "ko") ||
-                path.to_str().map_or(false, |s| s.ends_with(".ko.xz")) ||
-                path.to_str().map_or(false, |s| s.ends_with(".ko.zst"))
+                path.extension().is_some_and(|e| e == "ko") ||
+                path.to_str().is_some_and(|s| s.ends_with(".ko.xz")) ||
+                path.to_str().is_some_and(|s| s.ends_with(".ko.zst"))
             )
         {
             let driver = Driver::from_file(path, runner)?;
