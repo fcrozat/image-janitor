@@ -51,11 +51,16 @@ fn find_firmware_files_from_name(
             .filter(|p| p.exists())
             .collect())
     } else {
-        glob::glob(&pattern)
-            .expect("Failed to read glob pattern")
-            .filter_map(Result::ok)
-            .map(Ok)
-            .collect()
+        let mut results = HashSet::new();
+        for ext in ["", ".xz", ".zst"] {
+            let pattern_with_ext = format!("{}{}", pattern, ext);
+            results.extend(
+                glob::glob(&pattern_with_ext)
+                    .expect("Failed to read glob pattern")
+                    .filter_map(Result::ok),
+            );
+        }
+        Ok(results.into_iter().collect())
     }
 }
 
@@ -499,5 +504,35 @@ mod tests {
         let mut expected_glob = vec![fw1.clone(), fw2_xz.clone(), fw3_zst.clone()];
         expected_glob.sort();
         assert_eq!(found_glob, expected_glob);
+    }
+
+    #[test]
+    fn test_get_required_firmware_with_wildcard_and_compression() {
+        let temp_dir = tempdir().unwrap();
+        let kernel_dir = temp_dir.path().join("lib/modules/6.1.0-test");
+        fs::create_dir_all(&kernel_dir).unwrap();
+        let fw_dir = temp_dir.path().join("lib/firmware");
+        fs::create_dir_all(&fw_dir).unwrap();
+
+        let mod1_path = kernel_dir.join("mod1.ko");
+        fs::write(&mod1_path, "").unwrap();
+
+        let fw_file1 = fw_dir.join("brcm/brcmfmac43430-sdio.bin.xz");
+        let fw_file2 = fw_dir.join("brcm/brcmfmac43430-sdio.txt");
+        fs::create_dir_all(fw_dir.join("brcm")).unwrap();
+        fs::write(&fw_file1, "").unwrap();
+        fs::write(&fw_file2, "").unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("/usr/sbin/modinfo -F firmware {}", mod1_path.display()),
+            "brcm/brcmfmac*-sdio.bin".to_string(),
+        );
+        let runner = MockCommandRunner { responses };
+
+        let required_fw = get_required_firmware(&kernel_dir, &fw_dir, &runner).unwrap();
+        assert_eq!(required_fw.len(), 1);
+        assert!(required_fw.contains(&fw_file1));
+        assert!(!required_fw.contains(&fw_file2));
     }
 }
