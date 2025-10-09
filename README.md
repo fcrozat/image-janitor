@@ -56,7 +56,7 @@ image-janitor fw-cleanup --module-dir /path/to/modules --firmware-dir /path/to/f
 To build the project from source, you will need to have Rust installed. You can then clone the repository and build the project using Cargo:
 
 ```bash
-git clone https://github.com/example/image-janitor.git
+git clone https://github.com/fcrozat/image-janitor.git
 cd image-janitor
 cargo build --release
 ```
