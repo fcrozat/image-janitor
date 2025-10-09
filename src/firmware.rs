@@ -82,25 +82,42 @@ fn get_required_firmware(
 
 fn resolve_symlinks(path: &Path, base_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> {
     let mut paths_to_keep = vec![path.to_path_buf()];
+    let mut current_path = path.to_path_buf();
 
-    // If the path is a symlink, we try to resolve it.
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        match fs::canonicalize(path) {
-            Ok(final_target) => {
-                // Only keep the target if it's within the firmware directory.
-                // This prevents adding files from outside the scope (e.g., /usr/bin/true)
-                // and also implicitly handles broken links, as canonicalize would fail.
-                if final_target.starts_with(base_dir) {
-                    debug!(
-                        "Adding symlink target {} -> {}",
-                        path.display(),
-                        final_target.display()
-                    );
-                    paths_to_keep.push(final_target);
-                }
-            }
-            Err(e) => debug!("Could not canonicalize symlink {}: {}", path.display(), e),
+    // Limit the number of symlink hops to avoid infinite loops.
+    for _ in 0..10 {
+        if !fs::symlink_metadata(&current_path)?.file_type().is_symlink() {
+            // Not a symlink, so we're at the end of the chain.
+            break;
         }
+
+        let target = fs::read_link(&current_path)?;
+        // The target of a symlink can be a relative path. We need to resolve it
+        // relative to the directory containing the symlink.
+        let parent_dir = current_path.parent().unwrap_or_else(|| Path::new(""));
+        current_path = parent_dir.join(target);
+
+        // If the resolved path is not within the base directory, we stop.
+        if !current_path.starts_with(base_dir) {
+            debug!(
+                "Symlink target {} is outside the firmware directory.",
+                current_path.display()
+            );
+            return Ok(paths_to_keep);
+        }
+
+        // If the path doesn't exist, it's a broken link.
+        if !current_path.exists() {
+            debug!("Broken symlink found: {}", current_path.display());
+            return Ok(paths_to_keep);
+        }
+
+        debug!(
+            "Adding symlink target {} -> {}",
+            path.display(),
+            current_path.display()
+        );
+        paths_to_keep.push(current_path.clone());
     }
 
     Ok(paths_to_keep)
@@ -291,16 +308,21 @@ mod tests {
         let file_path = base_dir.join("file.bin");
         let link1_path = base_dir.join("link1");
         let link2_path = base_dir.join("link2");
+        let link3_path = base_dir.join("link3");
 
         fs::write(&file_path, "data").unwrap();
         symlink(&file_path, &link1_path).unwrap();
         symlink(&link1_path, &link2_path).unwrap();
+        symlink(&link2_path, &link3_path).unwrap();
 
-        let resolved = resolve_symlinks(&link2_path, base_dir).unwrap();
-        // The new implementation returns the starting link and the final canonical target.
-        assert_eq!(resolved.len(), 2);
+        let resolved = resolve_symlinks(&link3_path, base_dir).unwrap();
+
+        // The new implementation returns the starting link and all intermediate links/targets.
+        assert_eq!(resolved.len(), 4);
         assert!(resolved.contains(&file_path));
+        assert!(resolved.contains(&link1_path));
         assert!(resolved.contains(&link2_path));
+        assert!(resolved.contains(&link3_path));
     }
 
     #[test]
