@@ -2,6 +2,7 @@ use crate::command::CommandRunner;
 use crate::error::JanitorError;
 use crate::util;
 use log::{debug, info};
+use path_clean::PathClean;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,7 +101,7 @@ fn resolve_symlinks(path: &Path, base_dir: &Path) -> Result<Vec<PathBuf>, Janito
         // The target of a symlink can be a relative path. We need to resolve it
         // relative to the directory containing the symlink.
         let parent_dir = current_path.parent().unwrap_or_else(|| Path::new(""));
-        current_path = parent_dir.join(target);
+        current_path = parent_dir.join(target).clean();
 
         // If the resolved path is not within the base directory, we stop.
         if !current_path.starts_with(base_dir) {
@@ -534,5 +535,25 @@ mod tests {
         assert_eq!(required_fw.len(), 1);
         assert!(required_fw.contains(&fw_file1));
         assert!(!required_fw.contains(&fw_file2));
+    }
+
+    #[test]
+    fn test_resolve_symlinks_relative() {
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path();
+        let file_path = base_dir.join("file.bin");
+        let dir1 = base_dir.join("dir1");
+        let dir2 = dir1.join("dir2");
+        let link_path = dir2.join("link");
+
+        fs::create_dir_all(&dir2).unwrap();
+        fs::write(&file_path, "data").unwrap();
+        symlink("../../file.bin", &link_path).unwrap();
+
+        let resolved = resolve_symlinks(&link_path, base_dir).unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&file_path));
+        assert!(resolved.contains(&link_path));
     }
 }
